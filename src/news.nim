@@ -1,5 +1,5 @@
 import strutils, streams, random, base64, uri, strformat, nativesockets, oids,
-  strtabs, std/sha1, net, httpcore
+  options, strtabs, std/sha1, net, httpcore
 
 when not declaredInScope(newsUseChronos):
   # Currently chronos is second class citizen. To use this library in chronos-based
@@ -137,37 +137,40 @@ when not newsUseChronos:
     ws.readyState = Open
     return ws
 
-proc validateServerResponse(resp, secKey: string): string =
-  let respLines = resp.splitLines()
-  block statusCode:
-    const k = "HTTP/1.1 "
-    let i = respLines[0].find(k) + k.len
-    let v = respLines[0][i .. i + 2]
-    if v != "101":
-      return respLines[0][i ..< respLines[0].len]
+proc isStatusCodeValid(respLines: openarray[string], errorMessage: var Option[string]): bool =
+  result = true
+  const k = "HTTP/1.1 "
+  let i = respLines[0].find(k) + k.len
+  let v = respLines[0][i .. i + 2]
+  if v != "101":
+    errorMessage = some(respLines[0][i ..< respLines[0].len])
+    return false
 
-  var validatedHeaders: array[3, bool]
+proc areHeadersValid(respLines: openarray[string], secKey: string, errorMessage: var Option[string]): bool =
+  result = true
+  
+  var headers = newHttpHeaders()
   for i in 1 ..< respLines.len:
-    let h = parseHeader(respLines[i])
-    if h.key == "Upgrade":
-      if h.value[0].toLowerAscii != "websocket":
-        return "Upgrade header is invalid"
-      validatedHeaders[0] = true
+    let (key, value) = parseHeader(respLines[i])
+    headers[key] = value
 
-    elif h.key == "Connection":
-      if h.value[0].toLowerAscii != "upgrade":
-        return "Connection header is invalid"
-      validatedHeaders[1] = true
+  let expectedSecretKey = base64.encode(decodeBase16($secureHash(secKey & GUID)))
+  let expectedValues = @[("Upgrade", "websocket"),
+                         ("Connection", "upgrade"),
+                         ("Sec-WebSocket-Accept", expectedSecretKey)]
 
-    elif h.key == "Sec-WebSocket-Accept":
-      let sh = decodeBase16($secureHash(secKey & GUID))
-      if h.value[0].toLowerAscii != base64.encode(sh).toLowerAscii:
-        return "Secret key invalid"
-      validatedHeaders[2] = true
+  proc caseInsensitiveEquals(lhs, rhs: string): bool = lhs.toLowerAscii == rhs.toLowerAscii
 
-  if not validatedHeaders[0]: return "Missing Upgrade header"
-  if not validatedHeaders[1]: return "Missing Connection header"
-  if not validatedHeaders[2]: return "Missing Sec-WebSocket-Accept header"
+  for (header, expectedValue) in expectedValues:
+    if headers.hasKey(header):
+      if headers[header].caseInsensitiveEquals(expectedValue):
+        discard
+      else:
+        errorMessage = some(fmt"{header} header is invalid (got: {headers[header]}, expected: {expectedValue})")
+        return false
+    else:
+      errorMessage = some(fmt"Missing {header} header")
+      return false
 
 proc newWebSocket*(url: string, headers: StringTableRef = nil,
                    sslContext: SSLContext = getDefaultSslContext()): Future[WebSocket] {.async.} =
@@ -233,9 +236,12 @@ proc newWebSocket*(url: string, headers: StringTableRef = nil,
   while not output.endsWith(static(CRLF & CRLF)):
     output.add await ws.transp.recv(1)
 
-  let error = validateServerResponse(output, secKey)
-  if error.len > 0:
-    raise newException(WebSocketError, "WebSocket connection error: " & error)
+  var maybeErrorMessage: Option[string]
+  let respLines = output.splitLines()
+  if not (isStatusCodeValid(respLines, maybeErrorMessage) and
+          areHeadersValid(respLines, secKey, maybeErrorMessage)):
+    assert(maybeErrorMessage.isSome)
+    raise newException(WebSocketError, "WebSocket connection error: " & maybeErrorMessage.get())
 
   ws.readyState = Open
   ws.maskFrames = true
